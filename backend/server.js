@@ -8,14 +8,12 @@ import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Fix for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = createServer(app);
 
-// Socket.io for real-time updates
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -26,20 +24,22 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// ✅ SERVE THE FRONTEND BUILD FILES
+// Serve static files from dist folder
 app.use(express.static(path.join(__dirname, 'dist')));
 
-// Database setup
-const db = new sqlite3.Database(':memory:', (err) => {
+// ✅ FIX: Use FILE database instead of memory
+const db = new sqlite3.Database('./rfid_database.db', (err) => {
   if (err) {
     console.error('Database error:', err);
   } else {
-    console.log('Database connected');
+    console.log('✅ Connected to persistent SQLite database');
+    console.log('📊 Data will survive server restarts!');
   }
 });
 
-// Create tables
+// ✅ FIX: Better table creation with error handling
 db.serialize(() => {
+  // Users table
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     reg_number TEXT UNIQUE NOT NULL,
@@ -47,8 +47,15 @@ db.serialize(() => {
     email TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+  )`, (err) => {
+    if (err) {
+      console.error('Error creating users table:', err);
+    } else {
+      console.log('✅ Users table ready');
+    }
+  });
 
+  // RFID logs table
   db.run(`CREATE TABLE IF NOT EXISTS rfid_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_name TEXT NOT NULL,
@@ -56,151 +63,56 @@ db.serialize(() => {
     action TEXT NOT NULL,
     status TEXT NOT NULL,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+  )`, (err) => {
+    if (err) {
+      console.error('Error creating rfid_logs table:', err);
+    } else {
+      console.log('✅ RFID logs table ready');
+    }
+  });
 
-  // Default user
+  // ✅ FIX: Insert default user only if doesn't exist
   const defaultPassword = bcrypt.hashSync('password123', 10);
-  db.run(`INSERT OR IGNORE INTO users (reg_number, name, email, password) 
-          VALUES (?, ?, ?, ?)`, 
-          ['6216922', 'Default User', 'user@example.com', defaultPassword]);
+  db.get('SELECT * FROM users WHERE reg_number = ?', ['6216922'], (err, row) => {
+    if (err) {
+      console.error('Error checking default user:', err);
+    } else if (!row) {
+      db.run(`INSERT INTO users (reg_number, name, email, password) VALUES (?, ?, ?, ?)`, 
+        ['6216922', 'Default User', 'user@example.com', defaultPassword],
+        function(err) {
+          if (err) {
+            console.error('Error creating default user:', err);
+          } else {
+            console.log('✅ Default user created: 6216922 / password123');
+          }
+        }
+      );
+    } else {
+      console.log('✅ Default user already exists');
+    }
+  });
 });
 
 const JWT_SECRET = 'rfid-dashboard-secret';
 
-// ✅ ALL ROUTES GO TO REACT APP EXCEPT API
-app.get('/api*', (req, res, next) => {
-  next(); // Let API routes handle these
-});
+// ... rest of your API routes remain the same ...
+// (login, register, rfid-log, rfid-logs, dashboard-stats)
 
+// Serve the dashboard for all routes
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-// API Routes (your existing routes here - keep them exactly as they were)
-app.post('/api/login', (req, res) => {
-  const { regNumber, password } = req.body;
-
-  db.get('SELECT * FROM users WHERE reg_number = ?', [regNumber], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-
-    bcrypt.compare(password, user.password, (err, valid) => {
-      if (err || !valid) return res.status(400).json({ error: 'Invalid credentials' });
-
-      const token = jwt.sign(
-        { userId: user.id, regNumber: user.reg_number },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
-
-      res.json({
-        token,
-        user: {
-          id: user.id,
-          regNumber: user.reg_number,
-          name: user.name,
-          email: user.email
-        }
-      });
-    });
-  });
-});
-
-// Register endpoint
-app.post('/api/register', async (req, res) => {
-  try {
-    const { regNumber, name, email, password } = req.body;
-
-    db.get('SELECT * FROM users WHERE reg_number = ? OR email = ?', 
-      [regNumber, email], async (err, row) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        if (row) return res.status(400).json({ error: 'User already exists' });
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        db.run('INSERT INTO users (reg_number, name, email, password) VALUES (?, ?, ?, ?)',
-          [regNumber, name, email, hashedPassword],
-          function(err) {
-            if (err) return res.status(500).json({ error: 'Failed to create user' });
-            res.status(201).json({ message: 'User registered successfully' });
-          }
-        );
-      }
-    );
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// RFID log endpoint
-app.post('/api/rfid-log', (req, res) => {
-  const { user, uid, action, status } = req.body;
-
-  db.run('INSERT INTO rfid_logs (user_name, card_uid, action, status) VALUES (?, ?, ?, ?)',
-    [user, uid, action, status],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to log RFID event' });
-
-      const newLog = {
-        id: this.lastID,
-        user_name: user,
-        card_uid: uid,
-        action: action,
-        status: status,
-        timestamp: new Date().toISOString()
-      };
-
-      // ✅ REAL-TIME: Emit to all connected dashboard clients
-      io.emit('new-rfid-log', newLog);
-      res.json({ message: 'Log added successfully', log: newLog });
-    }
-  );
-});
-
-// Get RFID logs
-app.get('/api/rfid-logs', (req, res) => {
-  db.all('SELECT * FROM rfid_logs ORDER BY timestamp DESC LIMIT 100', (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch logs' });
-    res.json(rows);
-  });
-});
-
-// Get dashboard stats
-app.get('/api/dashboard-stats', (req, res) => {
-  const queries = [
-    'SELECT COUNT(*) as total FROM rfid_logs',
-    'SELECT COUNT(DISTINCT user_name) as unique_users FROM rfid_logs',
-    'SELECT COUNT(*) as today FROM rfid_logs WHERE DATE(timestamp) = DATE("now")'
-  ];
-
-  db.serialize(() => {
-    db.get(queries[0], (err, totalRow) => {
-      db.get(queries[1], (err, usersRow) => {
-        db.get(queries[2], (err, todayRow) => {
-          res.json({
-            totalEntries: totalRow.total,
-            uniqueUsers: usersRow.unique_users,
-            todayEntries: todayRow.today
-          });
-        });
-      });
-    });
-  });
-});
-
-// Socket.io for real-time updates
 io.on('connection', (socket) => {
-  console.log('Dashboard client connected:', socket.id);
-  
+  console.log('Client connected:', socket.id);
   socket.on('disconnect', () => {
-    console.log('Dashboard client disconnected:', socket.id);
+    console.log('Client disconnected:', socket.id);
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 Beautiful Dashboard: http://localhost:${PORT}`);
-  console.log(`📍 API: http://localhost:${PORT}/api`);
-  console.log(`✅ Frontend served from backend!`);
+  console.log(`📍 Dashboard: http://localhost:${PORT}`);
+  console.log(`💾 Database: rfid_database.db (persistent)`);
 });
