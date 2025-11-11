@@ -27,18 +27,19 @@ app.use(express.json());
 // Serve static files from dist folder
 app.use(express.static(path.join(__dirname, 'dist')));
 
-// Database setup
+// ✅ FIX: Use memory database for now (it works!)
 const db = new sqlite3.Database(':memory:', (err) => {
   if (err) {
     console.error('Database error:', err);
   } else {
-    console.log('Database connected');
+    console.log('✅ Database connected');
   }
 });
 
-// Create tables (your existing code)
+// ✅ SIMPLE table creation
 db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
+  // Users table
+  db.run(`CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     reg_number TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
@@ -47,7 +48,8 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS rfid_logs (
+  // RFID logs table
+  db.run(`CREATE TABLE rfid_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_name TEXT NOT NULL,
     card_uid TEXT NOT NULL,
@@ -56,30 +58,121 @@ db.serialize(() => {
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  // Default user
   const defaultPassword = bcrypt.hashSync('password123', 10);
-  db.run(`INSERT OR IGNORE INTO users (reg_number, name, email, password) 
-          VALUES (?, ?, ?, ?)`, 
-          ['6216922', 'Default User', 'user@example.com', defaultPassword]);
+  db.run(`INSERT INTO users (reg_number, name, email, password) VALUES (?, ?, ?, ?)`, 
+    ['6216922', 'Default User', 'user@example.com', defaultPassword],
+    function(err) {
+      if (err) {
+        console.log('Default user already exists');
+      } else {
+        console.log('✅ Default user created: 6216922 / password123');
+      }
+    }
+  );
 });
 
 const JWT_SECRET = 'rfid-dashboard-secret';
 
-// API Routes (keep your existing routes)
+// Root route
+app.get('/', (req, res) => {
+  res.json({ 
+    message: '🚀 RFID Dashboard API is LIVE!',
+    status: 'Running',
+    version: '1.0.0'
+  });
+});
+
+// Login endpoint
 app.post('/api/login', (req, res) => {
-  // Your existing login code
+  const { regNumber, password } = req.body;
+  console.log('Login attempt for:', regNumber);
+
+  db.get('SELECT * FROM users WHERE reg_number = ?', [regNumber], (err, user) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    if (!user) {
+      console.log('User not found:', regNumber);
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    bcrypt.compare(password, user.password, (err, valid) => {
+      if (err || !valid) {
+        console.log('Invalid password for:', regNumber);
+        return res.status(400).json({ error: 'Invalid credentials' });
+      }
+
+      const token = jwt.sign(
+        { userId: user.id, regNumber: user.reg_number },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      console.log('Login successful for:', user.name);
+      res.json({
+        token,
+        user: {
+          id: user.id,
+          regNumber: user.reg_number,
+          name: user.name,
+          email: user.email
+        }
+      });
+    });
+  });
 });
 
+// Register endpoint
 app.post('/api/register', async (req, res) => {
-  // Your existing register code
+  try {
+    const { regNumber, name, email, password } = req.body;
+    console.log('Registration attempt:', regNumber, name);
+
+    db.get('SELECT * FROM users WHERE reg_number = ? OR email = ?', 
+      [regNumber, email], async (err, row) => {
+        if (err) {
+          console.error('Database error:', err);
+          return res.status(500).json({ error: 'Database error' });
+        }
+        if (row) {
+          console.log('User already exists:', regNumber);
+          return res.status(400).json({ error: 'User already exists' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        db.run('INSERT INTO users (reg_number, name, email, password) VALUES (?, ?, ?, ?)',
+          [regNumber, name, email, hashedPassword],
+          function(err) {
+            if (err) {
+              console.error('Failed to create user:', err);
+              return res.status(500).json({ error: 'Failed to create user' });
+            }
+            console.log('User registered successfully:', name);
+            res.status(201).json({ message: 'User registered successfully' });
+          }
+        );
+      }
+    );
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
+// RFID log endpoint
 app.post('/api/rfid-log', (req, res) => {
   const { user, uid, action, status } = req.body;
+  console.log('RFID Log:', user, uid, action, status);
 
   db.run('INSERT INTO rfid_logs (user_name, card_uid, action, status) VALUES (?, ?, ?, ?)',
     [user, uid, action, status],
     function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to log RFID event' });
+      if (err) {
+        console.error('Failed to log RFID:', err);
+        return res.status(500).json({ error: 'Failed to log RFID event' });
+      }
 
       const newLog = {
         id: this.lastID,
@@ -91,18 +184,24 @@ app.post('/api/rfid-log', (req, res) => {
       };
 
       io.emit('new-rfid-log', newLog);
+      console.log('RFID log saved:', newLog);
       res.json({ message: 'Log added successfully', log: newLog });
     }
   );
 });
 
+// Get RFID logs
 app.get('/api/rfid-logs', (req, res) => {
   db.all('SELECT * FROM rfid_logs ORDER BY timestamp DESC LIMIT 100', (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch logs' });
+    if (err) {
+      console.error('Failed to fetch logs:', err);
+      return res.status(500).json({ error: 'Failed to fetch logs' });
+    }
     res.json(rows);
   });
 });
 
+// Get dashboard stats
 app.get('/api/dashboard-stats', (req, res) => {
   const queries = [
     'SELECT COUNT(*) as total FROM rfid_logs',
@@ -114,6 +213,10 @@ app.get('/api/dashboard-stats', (req, res) => {
     db.get(queries[0], (err, totalRow) => {
       db.get(queries[1], (err, usersRow) => {
         db.get(queries[2], (err, todayRow) => {
+          if (err) {
+            console.error('Stats error:', err);
+            return res.status(500).json({ error: 'Failed to get stats' });
+          }
           res.json({
             totalEntries: totalRow.total,
             uniqueUsers: usersRow.unique_users,
